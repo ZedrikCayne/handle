@@ -1,0 +1,3 @@
+[submodule "crankshaft"]
+	path = crankshaft
+	url = git@github.com:/ZedrikCayne/crankshaft.git

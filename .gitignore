@@ -1,0 +1,5 @@
+build/
+secrets/
+logs/
+*.swp
+.clangd

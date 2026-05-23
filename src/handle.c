@@ -102,9 +102,9 @@ bool forward( struct CS_ClientInfo *info, int portNum ) {
         CS_serverReplyError( info, CS_RESPONSE_500, "OOM forwarding" );
         goto CLEANUP;
     }
-    char *tbuff = CS_tempBuffSnprintf( 2048, "http://127.0.0.1:%d%s", portNum, info->requestInfo.uri );
+    const struct CS_String *tbuff = CS_stringTempSnprintf( 2048, "http://127.0.0.1:%d%.*s", portNum, info->requestInfo.uri.length, info->requestInfo.uri.data );
 
-    CS_serverRemoveRequestHeader( info, "Content-Length" );
+    CS_serverRemoveRequestHeader( info, &CS_STRING("Content-Length") );
     //Fire off the request to where we are forwarding it to.
     reply = CS_httpStartRequest( info->requestInfo.requestMethodEnum,
             tbuff,

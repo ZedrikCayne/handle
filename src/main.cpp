@@ -135,9 +135,10 @@ void dcCallback( struct CS_ClientInfo *info ) {
     CS_LOG_TRACE("Disconnecting.");
 }
 
+static const struct CS_String colorrace = CS_STRING("/colorrace");
 struct CS_Route serverRoutes[] = {
-    { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_PREFIX,   10, "/colorrace", forward8080 }, 
-    { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_WILDCARD,  0, "",           forward8081 },
+    { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_PREFIX,   &colorrace,     forward8080 }, 
+    { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_WILDCARD, NULL,           forward8081 },
 };
 
 int main(int argc, char *argv[] ) {
@@ -192,6 +193,7 @@ int main(int argc, char *argv[] ) {
 
     struct CS_WebServer *server = CS_serverStart( portNum, certFile, keyFile, selfSignHostname, fileServingDir, fileServingFile, cacheTimeInSeconds, serverRoutes, sizeof(serverRoutes)/sizeof(serverRoutes[0]) );
     if( server != NULL ) {
+        if( logAccess != NULL ) server->logAccess = CS_logfileCreate( logAccess, 5, 10000000, 24*3600 );
         CS_LOG_INFO("Server started at port %d", server->serverPort);
         while(!GotInterrupt) {
             if( GotHup ) hupOnMainThread();

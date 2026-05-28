@@ -25,6 +25,7 @@ struct forwardContext {
     struct CS_Mutex *mutex;
     struct CS_Thread *thread;
     struct CS_ClientInfo *info;
+    struct CS_Socket *socket;
     struct CS_RequestReply *reply;
     bool clientClosed;
     bool serverClosed;
@@ -36,20 +37,29 @@ bool forwardThread(struct CS_Thread *myThread, int threadState, void *context) {
     switch( threadState ) {
     case CS_THREAD_START:
         CS_mutexLock( fwd->mutex );
+        break;
     case CS_THREAD_RUNNING:
-        if( fwd->serverClosed ) return true;
+        if( fwd->serverClosed ) {
+            return true;
+        } else
         {
-            int bytesInFromRemote = CS_httpFillReplyFromRemote( fwd->reply );
-            if( bytesInFromRemote <= 0 ) {
+            int32_t bytesFilled = CS_socketFillIncomingBuffer( fwd->socket, false );
+            if( bytesFilled <= 0 ) {
+                //Our socket is closed or had some error...flow it back up. Might be closed
+                //already.
+                CS_serverKillClientSocket( fwd->info );
                 return true;
             }
-            while( CS_PP_dataSize(fwd->reply->buffer) > 0 ) {
-                CS_PP_moveBuffer( fwd->reply->buffer, fwd->info->output );
+            struct CS_PushPullBuffer *ppIncoming = CS_socketLockInputBuffer( fwd->socket );
+            while( CS_PP_dataSize(ppIncoming) > 0 ) {
+                int32_t moved = CS_PP_moveBuffer( ppIncoming, fwd->info->output );
                 int bytesToServer = CS_serverWriteOutputBuffer( fwd->info );
                 if( bytesToServer <= 0 ) {
+                    CS_socketUnlockInputBuffer( fwd->socket );
                     return true;
                 }
             }
+            CS_socketUnlockInputBuffer( fwd->socket );
         }
 
         break;
@@ -92,6 +102,7 @@ bool forward8087( struct CS_ClientInfo *info ) {
     return forward(info,8087);
 }
 
+#define SOCKET_BUFFER_SIZE 8192
 
 bool forward( struct CS_ClientInfo *info, int portNum ) {
     struct CS_Thread *pRemoteThread = NULL;
@@ -102,18 +113,15 @@ bool forward( struct CS_ClientInfo *info, int portNum ) {
         CS_serverReplyError( info, CS_RESPONSE_500, "OOM forwarding" );
         goto CLEANUP;
     }
-    const struct CS_String *tbuff = CS_stringTempSnprintf( 2048, "http://127.0.0.1:%d%.*s", portNum, info->requestInfo.uri.length, info->requestInfo.uri.data );
 
-    CS_serverRemoveRequestHeader( info, &CS_STRING("Content-Length") );
-    //Fire off the request to where we are forwarding it to.
-    reply = CS_httpStartRequest( info->requestInfo.requestMethodEnum,
-            tbuff,
-            info->requestInfo.headers, info->requestInfo.numHeaders, 
-            info->requestInfo.parameters, info->requestInfo.numParameters,
-            info->requestInfo.formParameters, info->requestInfo.numFormParameters,
-            NULL, 0, NULL );
+    if( CS_PP_toothpaste( info->buffer, info->requestInfo.headerSize ) ) {
+        CS_serverReplyError( info, CS_RESPONSE_500, "Could not put the toothpaste back in the tube." );
+        goto CLEANUP;
+    }
 
-    if( reply == NULL ) {
+    fullContext->socket = CS_socketConnect( "127.0.0.1", false, portNum, false, false, SOCKET_BUFFER_SIZE, 8192, false, false );
+
+    if( fullContext->socket == NULL ) {
         CS_serverReplyError( info, CS_RESPONSE_403, "Remote not responding" );
         goto CLEANUP;
     }
@@ -129,11 +137,16 @@ bool forward( struct CS_ClientInfo *info, int portNum ) {
     //
     //The other thread will eat from the remote and shove out to the request source.
     do {
-        int outgoing = CS_httpPushBufferToRemote( reply, info->buffer );
+        int32_t moved = CS_PP_moveBuffer( info->buffer, CS_socketLockOutputBuffer( fullContext->socket ) );
+        CS_socketUnlockOutputBuffer( fullContext->socket );
+        int outgoing = CS_socketEmptyOutputBuffer( fullContext->socket, false );
         if( outgoing < 0 ) break;
         int incoming = CS_serverFillIncomingBuffer( info );
         if( incoming < 0 ) break;
     } while(true);
+
+    //Close the pass through socket. (Might be closed already)
+    CS_socketClose( fullContext->socket );
 
     CS_mutexLock( fullContext->mutex );
     CS_mutexUnlock( fullContext->mutex );

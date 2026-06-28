@@ -137,9 +137,11 @@ void dcCallback( struct CS_ClientInfo *info ) {
 
 static const struct CS_String colorrace = CS_STRING("/colorrace");
 static const struct CS_String cardswithfriends = CS_STRING("/cardswithfriends");
+static const struct CS_String freezer = CS_STRING("/freezer");
 struct CS_Route serverRoutes[] = {
     { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_PREFIX,   &colorrace,       forward8080 }, 
     { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_PREFIX,   &cardswithfriends,forward8086 }, 
+    { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_PREFIX,   &freezer,         forward8087 },
     { CS_HTTP_METHOD_ANY, CS_ROUTE_TYPE_WILDCARD, NULL,             forward8081 },
 };
 

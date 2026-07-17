@@ -200,7 +200,10 @@ int main(int argc, char *argv[] ) {
         if( logAccess != NULL ) server->logAccess = CS_logfileCreate( logAccess, 5, 10000000, 24*3600 );
         CS_LOG_INFO("Server started at port %d", server->serverPort);
         while(!GotInterrupt) {
-            if( GotHup ) hupOnMainThread();
+            if( GotHup ) {
+                hupOnMainThread();
+                if( server->logAccess ) CS_logfileFlush( server->logAccess );
+            }
             sleep(1);
         }
         CS_serverKill(server);

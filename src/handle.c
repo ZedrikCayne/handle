@@ -16,8 +16,26 @@
 #include <crankshaft/mutex.h>
 #include <crankshaft/alloc.h>
 #include <crankshaft/tempbuff.h>
+#include <crankshaft/network.h>
+#include <crankshaft/pipe.h>
 
 #include "handle.h"
+
+//Pipe segments...pipe entry for 'CS_Socket in/out' and 'CS_Reply in/out' and
+//CS_ClientInfo in/out
+struct socket_data {
+    struct CS_Socket *cs_socket;
+};
+
+struct reply_data {
+    struct CS_Reply *cs_reply;
+};
+
+struct client_info_data {
+    struct CS_ClientInfo *cs_client;
+    struct CS_ReplyInfo *cs_reply;
+};
+
 
 bool forward( struct CS_ClientInfo *info, int portNum );
 
@@ -31,7 +49,44 @@ struct forwardContext {
     bool serverClosed;
 }; 
 
-bool forwardThread(struct CS_Thread *myThread, int threadState, void *context) {
+bool forwardThreadReply(struct CS_Thread *myThread, int threadState, void *context) {
+    struct forwardContext *fwd = (struct forwardContext *)context;
+    switch( threadState ) {
+    case CS_THREAD_START:
+        CS_mutexLock( fwd->mutex );
+        break;
+    case CS_THREAD_RUNNING:
+        if( fwd->serverClosed ) {
+            return true;
+        } else {
+            int32_t bytesFilled = CS_httpFillReplyFromRemote( fwd->reply );
+            if( bytesFilled <= 0 ) {
+                //Our socket is closed or had some error...flow it back up. Might be closed
+                //already.
+                CS_serverKillClientSocket( fwd->info );
+                return true;
+            }
+            struct CS_PushPullBuffer *ppIncoming = fwd->reply->buffer;
+            while( CS_PP_dataSize(ppIncoming) > 0 ) {
+                if( CS_PP_moveBuffer( ppIncoming, fwd->info->output ) < 0 ) {
+                    return true;
+                }
+                int bytesToServer = CS_serverWriteOutputBuffer( fwd->info );
+                if( bytesToServer <= 0 ) {
+                    return true;
+                }
+            }
+        }
+
+        break;
+    case CS_THREAD_STOP:
+        CS_mutexUnlock( fwd->mutex );
+        break;
+    }
+    return false;
+}
+
+bool forwardThreadCSSocket(struct CS_Thread *myThread, int threadState, void *context) {
     struct forwardContext *fwd = (struct forwardContext *)context;
 
     switch( threadState ) {
@@ -104,8 +159,80 @@ bool forward8087( struct CS_ClientInfo *info ) {
 
 #define SOCKET_BUFFER_SIZE 8192
 
+bool relayForward( struct CS_ClientInfo *info, int portNum ) {
+    struct CS_RequestReply *reply = NULL;
+    struct forwardContext *fullContext = CS_allocZero( sizeof(struct forwardContext) );
+
+    if( CS_serverGetRequestHeader(info, &CS_STRING("X-Forwarded-For") ) != NULL ) { 
+        CS_serverReplyError( info, 421, "Edge server. Must be first in forward chain." );
+        return true;
+    }
+    if( CS_serverGetRequestHeader(info, &CS_STRING("X-Real-IP")) != NULL ) {
+        CS_serverReplyError( info, 421, "Edge server. Must be first in forward chain." );
+        return true;
+    }
+    
+    if( fullContext == NULL ) {
+        CS_serverReplyError( info, CS_RESPONSE_500, "OOM forwarding" );
+        goto CLEANUP;
+    }
+
+    const struct CS_String *networkAddress = CS_networkAddressToTempString( &info->clientSocketAddress );
+    CS_serverAddOrReplaceRequestHeader( info, &CS_STRING("X-Real-IP"), networkAddress );
+    CS_serverAddOrReplaceRequestHeader( info, &CS_STRING("X-Forwarded-For"), networkAddress );
+    CS_serverAddOrReplaceRequestHeader( info, &CS_STRING("X-Forwarded-Proto"), info->ssl?&CS_STRING("https"):&CS_STRING("http") );
+
+    struct CS_RequestInfo *requestInfo = &info->requestInfo;
+
+    //If we've got a num form parameters, we need to remove the content.
+    if( requestInfo->numFormParameters != 0 ) {
+        CS_serverRemoveRequestHeader(info, &CS_STRING("Content-Length"));
+    }
+
+    reply = CS_httpStartRequest(
+            CS_httpStringToMethodEnum( &requestInfo->method ),
+            CS_stringTempSnprintf(1024, "http://127.0.0.1:%d%.*s", portNum, requestInfo->uri.length, requestInfo->uri.data ),
+            requestInfo->headers, 
+            requestInfo->numHeaders,
+            requestInfo->parameters,
+            requestInfo->numParameters,
+            requestInfo->formParameters,
+            requestInfo->numFormParameters,
+            NULL, 0, NULL );
+
+    if( reply == NULL ) {
+        CS_serverReplyError( info, CS_RESPONSE_403, "Remote not responding" );
+        return true;
+    }
+
+    if( reply->responseEnum == CS_RESPONSE_101 ) {
+        //We're hitting one of them websockets. Spin it up!
+        fullContext->reply = reply;
+        fullContext->info = info;
+        struct CS_Thread *remoteThread = CS_threadStart("Remote", fullContext, forwardThreadCSSocket );
+        do {
+            int outgoing = CS_httpPushBufferToRemote( reply, info->buffer );
+            if( outgoing < 0 ) break;
+            int incoming = CS_serverFillIncomingBuffer( info );
+            if( incoming < 0 ) {
+                fullContext->serverClosed = true;
+                break;
+            }
+        } while(true);
+        CS_mutexLock( fullContext->mutex );
+        CS_mutexUnlock( fullContext->mutex );
+        CS_mutexReturn( fullContext->mutex );
+        CS_threadReturn( remoteThread );
+        return true;
+    } else {
+    }
+
+CLEANUP:
+    return false;
+}
+
 bool forward( struct CS_ClientInfo *info, int portNum ) {
-    struct CS_Thread *pRemoteThread = NULL;
+    struct CS_Thread *remoteThread = NULL;
     struct CS_RequestReply *reply = NULL;
     struct forwardContext *fullContext = CS_allocZero( sizeof(struct forwardContext) );
 
@@ -130,14 +257,14 @@ bool forward( struct CS_ClientInfo *info, int portNum ) {
     fullContext->reply = reply;
     fullContext->info = info;
 
-    pRemoteThread = CS_threadStart("Remote", fullContext, forwardThread );
+    remoteThread = CS_threadStart("Remote", fullContext, forwardThreadCSSocket );
 
     //This thread is the one that sucks in from the request,
     //and shoves directly out to the remote.
     //
     //The other thread will eat from the remote and shove out to the request source.
     do {
-        int32_t moved = CS_PP_moveBuffer( info->buffer, CS_socketLockOutputBuffer( fullContext->socket ) );
+        CS_PP_moveBuffer( info->buffer, CS_socketLockOutputBuffer( fullContext->socket ) );
         CS_socketUnlockOutputBuffer( fullContext->socket );
         int outgoing = CS_socketEmptyOutputBuffer( fullContext->socket, false );
         if( outgoing < 0 ) break;
@@ -151,7 +278,7 @@ bool forward( struct CS_ClientInfo *info, int portNum ) {
     CS_mutexLock( fullContext->mutex );
     CS_mutexUnlock( fullContext->mutex );
     CS_mutexReturn( fullContext->mutex );
-    CS_threadReturn( pRemoteThread );
+    CS_threadReturn( remoteThread );
 
 CLEANUP:
     if( reply ) CS_httpCloseRequest( reply );

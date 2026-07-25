@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.24)
 
 project( handle )
 
+set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
+
 if ( ${CMAKE_SYSTEM_NAME} MATCHES "Darwin" )
 set(MACOSX TRUE)
 find_package(OpenSSL)

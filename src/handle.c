@@ -230,6 +230,7 @@ bool forward8087( struct CS_RequestInfo *info ) {
 bool relayForward( struct CS_RequestInfo *info, int portNum ) {
     bool returnValue = false;
     struct CS_RequestReply *reply = NULL;
+    struct forwardContext *fullContext = NULL;
 
     if( CS_serverGetRequestHeader(info, &CS_STRING("X-Forwarded-For") ) != NULL ) { 
         CS_serverReplyError( info, 421, "Edge server. Must be first in forward chain." );
@@ -242,20 +243,23 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
         goto CLEANUP;
     }
     
-    struct forwardContext *fullContext = CS_allocZero( sizeof(struct forwardContext) );
+    fullContext = CS_allocZero( sizeof(struct forwardContext) );
 
     if( fullContext == NULL ) {
         CS_serverReplyError( info, CS_RESPONSE_500, "OOM forwarding" );
         returnValue = true;
         goto CLEANUP;
     }
+    
+    fullContext->mutex = CS_mutexTake();
+    fullContext->info = info->clientInfo;
 
     const struct CS_String *networkAddress = CS_networkAddressToTempString( &info->clientInfo->clientSocketAddress );
     CS_serverAddOrReplaceRequestHeader( info, &CS_STRING("X-Real-IP"), networkAddress );
     CS_serverAddOrReplaceRequestHeader( info, &CS_STRING("X-Forwarded-For"), networkAddress );
     CS_serverAddOrReplaceRequestHeader( info, &CS_STRING("X-Forwarded-Proto"), info->clientInfo->ssl?&CS_STRING("https"):&CS_STRING("http") );
 
-    //If we've got a num form parameters, we need to remove the content.
+    //If we've got a num form parameters, we need to remove the content length
     if( info->numFormParameters != 0 ) {
         CS_serverRemoveRequestHeader(info, &CS_STRING("Content-Length"));
     }
@@ -276,11 +280,48 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
         goto CLEANUP;
     }
 
+    fullContext->reply = reply;
+    
+    //We might need to finish the request off here. Especially if there was more
+    //data to go.
+    const struct CS_String *dataSize = CS_serverGetRequestHeader(info, &CS_STRING("Content-Length") );
+    int32_t bytesToFinishRequest = 0;
+    if( info->numFormParameters == 0 && dataSize != NULL ) {
+        bytesToFinishRequest = CS_stringAtoi(dataSize);
+    }
+    const struct CS_String *encoding = CS_serverGetRequestHeader(info, &CS_STRING("Transfer-Encoding") );
+    if( bytesToFinishRequest == 0 && encoding && CS_stringTempStrstr(encoding,&CS_STRING("chunked")) ) {
+        bytesToFinishRequest = -1;
+    }
+    
+    //Create the IO pipes.
+    struct CS_Pipe *outsideToUs = CS_pipeCreate( CS_PIPE_FWD_SERVER_IN, 0, fullContext );
+    struct CS_Pipe *usToServer = CS_pipeCreate( CS_PIPE_FWD_REPLY_OUT, 0, fullContext );
+    struct CS_Pipe *serverToUs = CS_pipeCreate( CS_PIPE_FWD_REPLY_IN, 0, fullContext );
+    struct CS_Pipe *usToOutside = CS_pipeCreate( CS_PIPE_FWD_SERVER_OUT, 0, fullContext );
+
+    if( bytesToFinishRequest != 0 ) {
+        if( bytesToFinishRequest < 0 ) {
+            //If this is negative, we don't know the size, but we know it is chunked. So connect
+            //a pipe that will stop when we've got all the chunk bits.
+            struct CS_Pipe *encodeCopy = CS_pipeCreate( CS_PIPE_CHUNK_COPY, 0, NULL );
+            if( encodeCopy == NULL ) {
+                goto CLEANUP;
+            }
+            CS_pipeHook( outsideToUs, encodeCopy );
+        } else {
+            //This is a positive number. Connect the pipe that will only transfer the number
+            //of bytes we want.
+            struct CS_Pipe *numBytesExtraPipe = CS_pipeCreate( CS_PIPE_LIMITED, 0, &bytesToFinishRequest );
+            if( numBytesExtraPipe == NULL ) {
+                goto CLEANUP;
+            }
+            CS_pipeHook( outsideToUs, numBytesExtraPipe );
+        }
+    }
+
     if( reply->responseEnum == CS_RESPONSE_101 ) {
         //We're hitting one of them websockets. Spin it up!
-        fullContext->reply = reply;
-        fullContext->info = info->clientInfo;
-        fullContext->mutex = CS_mutexTake();
         //Kick off!
         struct CS_Thread *remoteThread = CS_threadStart("Remote", fullContext, forwardThreadCSSocket );
         if( remoteThread == NULL ) {
@@ -306,6 +347,10 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
             returnValue = true;
         }
         CS_mutexReturn( fullContext->mutex );
+    }
+    else 
+    {
+        //Craft a reply from the reply we got.
     }
 
 CLEANUP:

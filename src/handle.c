@@ -137,10 +137,12 @@ bool forwardThreadReply(struct CS_Thread *myThread, int threadState, void *conte
             struct CS_PushPullBuffer *ppIncoming = fwd->reply->buffer;
             while( CS_PP_dataSize(ppIncoming) > 0 ) {
                 if( CS_PP_moveBuffer( ppIncoming, fwd->info->output ) < 0 ) {
+                    CS_serverKillClientSocket( fwd->info );
                     return true;
                 }
                 int bytesToServer = CS_serverWriteOutputBuffer( fwd->info );
                 if( bytesToServer <= 0 ) {
+                    CS_serverKillClientSocket( fwd->info );
                     return true;
                 }
             }
@@ -179,6 +181,7 @@ bool forwardThreadCSSocket(struct CS_Thread *myThread, int threadState, void *co
                 int bytesToServer = CS_serverWriteOutputBuffer( fwd->info );
                 if( bytesToServer <= 0 ) {
                     CS_socketUnlockInputBuffer( fwd->socket );
+                    CS_serverKillClientSocket( fwd->info );
                     return true;
                 }
             }
@@ -231,6 +234,10 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
     bool returnValue = false;
     struct CS_RequestReply *reply = NULL;
     struct forwardContext *fullContext = NULL;
+    struct CS_Pipe *outsideToUs = NULL;
+    struct CS_Pipe *usToServer = NULL;
+    struct CS_Pipe *serverToUs = NULL;
+    struct CS_Pipe *usToOutside = NULL;
 
     if( CS_serverGetRequestHeader(info, &CS_STRING("X-Forwarded-For") ) != NULL ) { 
         CS_serverReplyError( info, 421, "Edge server. Must be first in forward chain." );
@@ -282,6 +289,14 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
 
     fullContext->reply = reply;
     
+    //Create the IO pipes.
+    outsideToUs = CS_pipeCreate( CS_PIPE_FWD_SERVER_IN, 0, fullContext );
+    usToServer = CS_pipeCreate( CS_PIPE_FWD_REPLY_OUT, 0, fullContext );
+    serverToUs = CS_pipeCreate( CS_PIPE_FWD_REPLY_IN, 0, fullContext );
+    usToOutside = CS_pipeCreate( CS_PIPE_FWD_SERVER_OUT, 0, fullContext );
+    
+NEXT_MESSAGE:
+   
     //We might need to finish the request off here. Especially if there was more
     //data to go.
     const struct CS_String *dataSize = CS_serverGetRequestHeader(info, &CS_STRING("Content-Length") );
@@ -293,35 +308,45 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
     if( bytesToFinishRequest == 0 && encoding && CS_stringTempStrstr(encoding,&CS_STRING("chunked")) ) {
         bytesToFinishRequest = -1;
     }
-    
-    //Create the IO pipes.
-    struct CS_Pipe *outsideToUs = CS_pipeCreate( CS_PIPE_FWD_SERVER_IN, 0, fullContext );
-    struct CS_Pipe *usToServer = CS_pipeCreate( CS_PIPE_FWD_REPLY_OUT, 0, fullContext );
-    struct CS_Pipe *serverToUs = CS_pipeCreate( CS_PIPE_FWD_REPLY_IN, 0, fullContext );
-    struct CS_Pipe *usToOutside = CS_pipeCreate( CS_PIPE_FWD_SERVER_OUT, 0, fullContext );
 
     if( bytesToFinishRequest != 0 ) {
         if( bytesToFinishRequest < 0 ) {
             //If this is negative, we don't know the size, but we know it is chunked. So connect
             //a pipe that will stop when we've got all the chunk bits.
-            struct CS_Pipe *encodeCopy = CS_pipeCreate( CS_PIPE_CHUNK_COPY, 0, NULL );
+            struct CS_Pipe *encodeCopy = CS_pipeCreate( CS_PIPE_CHUNK_COPY, SOCKET_BUFFER_SIZE, NULL );
             if( encodeCopy == NULL ) {
                 goto CLEANUP;
             }
             CS_pipeHook( outsideToUs, encodeCopy );
+            CS_pipeHook( encodeCopy, usToServer );
         } else {
             //This is a positive number. Connect the pipe that will only transfer the number
             //of bytes we want.
-            struct CS_Pipe *numBytesExtraPipe = CS_pipeCreate( CS_PIPE_LIMITED, 0, &bytesToFinishRequest );
+            struct CS_Pipe *numBytesExtraPipe = CS_pipeCreate( CS_PIPE_LIMITED, SOCKET_BUFFER_SIZE, &bytesToFinishRequest );
             if( numBytesExtraPipe == NULL ) {
                 goto CLEANUP;
             }
             CS_pipeHook( outsideToUs, numBytesExtraPipe );
+            CS_pipeHook( numBytesExtraPipe, usToServer );
         }
+        while( !CS_pipeDoneOrError( outsideToUs ) ) CS_pipeProcess( outsideToUs );
     }
 
+    //The response should be finished by now. At least enough to have the 'reply'
+    //bits done.
+
+
+    
+
     if( reply->responseEnum == CS_RESPONSE_101 ) {
-        //We're hitting one of them websockets. Spin it up!
+        //We're hitting one of them websockets. The remote connection is now a raw
+        //pass-through, so wrap the reply's socket to feed the remote thread.
+        fullContext->socket = CS_socketInit( reply->remoteSocket, portNum, reply->ssl,
+                                            SOCKET_BUFFER_SIZE, 8192, false, false );
+        if( fullContext->socket == NULL ) {
+            CS_serverReplyError( info, CS_RESPONSE_500, "Cannot wrap remote socket." );
+            goto CLEANUP;
+        }
         //Kick off!
         struct CS_Thread *remoteThread = CS_threadStart("Remote", fullContext, forwardThreadCSSocket );
         if( remoteThread == NULL ) {
@@ -346,15 +371,22 @@ bool relayForward( struct CS_RequestInfo *info, int portNum ) {
             CS_threadReturn( remoteThread );
             returnValue = true;
         }
-        CS_mutexReturn( fullContext->mutex );
     }
-    else 
+    else
     {
         //Craft a reply from the reply we got.
     }
 
 CLEANUP:
-    if( fullContext ) CS_free( fullContext );
+    if( outsideToUs ) CS_pipeFree( outsideToUs );
+    if( usToServer ) CS_pipeFree( usToServer );
+    if( serverToUs ) CS_pipeFree( serverToUs );
+    if( usToOutside ) CS_pipeFree( usToOutside );
+    if( fullContext ) {
+        if( fullContext->socket ) CS_socketDestroy( fullContext->socket );
+        if( fullContext->mutex ) CS_mutexReturn( fullContext->mutex );
+        CS_free( fullContext );
+    }
     if( reply ) CS_httpCloseRequest( reply );
     return returnValue;
 }
@@ -391,26 +423,34 @@ bool forward( struct CS_RequestInfo *info, int portNum ) {
     //and shoves directly out to the remote.
     //
     //The other thread will eat from the remote and shove out to the request source.
-    do {
+    while(true) {
         CS_PP_moveBuffer( info->clientInfo->buffer, CS_socketLockOutputBuffer( fullContext->socket ) );
         CS_socketUnlockOutputBuffer( fullContext->socket );
-        int outgoing = CS_socketEmptyOutputBuffer( fullContext->socket, false );
-        if( outgoing < 0 ) break;
-        int incoming = CS_serverFillIncomingBuffer( info->clientInfo );
-        if( incoming < 0 ) break;
-    } while(true);
+        if( CS_socketEmptyOutputBuffer( fullContext->socket, false ) < 0 ) break;
+        //Still holding data for the remote. Keep moving it instead of
+        //reading more (the client buffer might be full, in which case a
+        //read would return 0 without telling us why).
+        if( CS_PP_dataSize( info->clientInfo->buffer ) > 0 ) continue;
+        //0 is a clean EOF (client went away). Break on it, or we spin
+        //forever and never return the request.
+        if( CS_serverFillIncomingBuffer( info->clientInfo ) <= 0 ) break;
+    }
 
     //Close the pass through socket. (Might be closed already)
     CS_socketClose( fullContext->socket );
 
+    //The thread holds the mutex from START to STOP, so once we have it,
+    //it is done with the context and safe to tear everything down.
     CS_mutexLock( fullContext->mutex );
     CS_mutexUnlock( fullContext->mutex );
-    CS_mutexReturn( fullContext->mutex );
     CS_threadReturn( remoteThread );
 
 CLEANUP:
     if( reply ) CS_httpCloseRequest( reply );
-    if( fullContext ) CS_free( fullContext );
-    fullContext = NULL;
+    if( fullContext ) {
+        if( fullContext->socket ) CS_socketDestroy( fullContext->socket );
+        if( fullContext->mutex ) CS_mutexReturn( fullContext->mutex );
+        CS_free( fullContext );
+    }
     return true;
 }
